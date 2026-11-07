@@ -1,7 +1,6 @@
 # -*- coding: utf-8 -*-
 import os
 import sys
-import random
 import logging
 from typing import List, Dict, Any
 
@@ -16,12 +15,16 @@ from aiogram.types import (
 from aiogram.utils.keyboard import InlineKeyboardBuilder
 
 from places_data import PLACES, CATEGORY_NAMES, DISTANCE_GROUPS
+import db
 
 # Настройка логирования
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
 logger = logging.getLogger(__name__)
 
-# Токен берется из переменной окружения BOT_TOKEN или .env
+# Инициализация базы данных
+db.init_db()
+
+# Получение токена
 TOKEN = os.getenv("BOT_TOKEN")
 if not TOKEN:
     env_file = os.path.join(os.path.dirname(__file__), ".env")
@@ -32,32 +35,28 @@ if not TOKEN:
                     TOKEN = line.strip().split("=", 1)[1].strip().strip('"').strip("'")
                     break
 
-if not TOKEN or TOKEN == "YOUR_TELEGRAM_BOT_TOKEN_HERE":
-    print("\n[!] ОШИБКА: Не указан токен бота в переменной BOT_TOKEN или в файле .env!")
-    print("[!] Создай файл .env в этой папке и напиши: BOT_TOKEN=твой_токен")
-    print("[!] Получить токен можно бесплатно у @BotFather в Telegram за 1 минуту.\n")
-
-# Инициализация бота и диспетчера
 bot = Bot(token=TOKEN) if TOKEN and TOKEN != "YOUR_TELEGRAM_BOT_TOKEN_HERE" else None
 dp = Dispatcher()
 
 
 def get_main_menu_keyboard() -> ReplyKeyboardMarkup:
-    """Главная клавиатура бота."""
+    """Главная постоянная клавиатура бота."""
     kb = [
-        [KeyboardButton(text="🚗 Выбрать по расстоянию")],
-        [KeyboardButton(text="🌲 По категориям"), KeyboardButton(text="🎲 Случайное место")],
-        [KeyboardButton(text="ℹ️ О гиде (Точка старта: Озерки)")]
+        [KeyboardButton(text="🧭 Смотреть локации"), KeyboardButton(text="⭐ Избранное")],
+        [KeyboardButton(text="📏 Фильтр расстояния"), KeyboardButton(text="📊 Мой профиль")],
+        [KeyboardButton(text="🔄 Сбросить историю")]
     ]
     return ReplyKeyboardMarkup(keyboard=kb, resize_keyboard=True)
 
 
-def format_place_card(place: Dict[str, Any]) -> str:
-    """Форматирует карточку места со всеми деталями."""
+def format_card(place: Dict[str, Any]) -> str:
+    """Форматирование одной карточки локации."""
+    cat_emoji = CATEGORY_NAMES.get(place.get("category", ""), "📍")
     text = (
-        f"📍 <b>{place['title']}</b>\n\n"
-        f"⏱ <b>От м. Озерки:</b> ~{place['distance_km']} км ({place['car_time']})\n"
-        f"✨ <b>Вайб (Pinterest/TikTok):</b> {place['vibe']}\n\n"
+        f"<b>{place['title']}</b>\n"
+        f"<i>{cat_emoji}</i>\n\n"
+        f"⏱ <b>От м. Озерки:</b> ~{place['distance_km']} км ({place['car_time']})\n\n"
+        f"✨ <b>Вайб (Pinterest/TikTok):</b>\n{place['vibe']}\n\n"
         f"📅 <b>Лучший сезон:</b> {place['season']}\n"
         f"🌅 <b>Время суток:</b> {place['time_of_day']}\n\n"
         f"🚙 <b>На машине (дорога и парковка):</b>\n{place['car_access']}\n\n"
@@ -66,214 +65,318 @@ def format_place_card(place: Dict[str, Any]) -> str:
     return text
 
 
-def get_place_keyboard(place: Dict[str, Any], back_action: str = "main") -> InlineKeyboardMarkup:
-    """Инлайн-кнопки под карточкой места: Маршрут и Назад."""
+def get_swipe_keyboard(place_id: str, yandex_map_url: str) -> InlineKeyboardMarkup:
+    """Инлайн-кнопки для листания карточек по одной (Like / Skip / Route)."""
     builder = InlineKeyboardBuilder()
     builder.row(
-        InlineKeyboardButton(
-            text="🗺 Построить маршрут (Яндекс.Карты)",
-            url=place["yandex_map"]
-        )
+        InlineKeyboardButton(text="❤️ В избранное", callback_data=f"like_{place_id}"),
+        InlineKeyboardButton(text="➡️ Пропустить", callback_data=f"skip_{place_id}")
     )
-    if back_action.startswith("dist_"):
-        dist_key = back_action.split("_", 1)[1]
-        builder.row(InlineKeyboardButton(text="⬅️ Назад к этому расстоянию", callback_data=f"show_dist_{dist_key}"))
-    elif back_action.startswith("cat_"):
-        cat_key = back_action.split("_", 1)[1]
-        builder.row(InlineKeyboardButton(text="⬅️ Назад к этой категории", callback_data=f"show_cat_{cat_key}"))
-    
-    builder.row(InlineKeyboardButton(text="🎲 Другое случайное место", callback_data="random_place"))
-    builder.row(InlineKeyboardButton(text="🏠 Главное меню", callback_data="menu_home"))
+    builder.row(
+        InlineKeyboardButton(text="🗺 Маршрут в Яндекс.Картах", url=yandex_map_url)
+    )
     return builder.as_markup()
 
 
+# ---------------- ХЕНДЛЕРЫ МЕНЮ ----------------
+
 @dp.message(CommandStart())
 async def cmd_start(message: types.Message):
-    """Приветственное сообщение."""
+    user_id = message.from_user.id
+    dist_filter = db.get_user_distance_filter(user_id)
+    dist_name = DISTANCE_GROUPS.get(dist_filter, "Все")
+    
     greeting = (
-        "👋 <b>Привет, автопутешественник!</b>\n\n"
-        "Этот гид собран специально для вылазок на машине из Санкт-Петербурга.\n"
-        "📌 <b>Точка отсчета: метро «Озерки»</b> (север города, выезды на Выборгское шоссе, "
-        "трассу «Скандинавия», Приморское шоссе и КАД).\n\n"
-        "Все локации отобраны по трендам <b>Pinterest, TikTok и рекомендациям локалов</b> — "
-        "эстетичные экотропы, северные маяки, песчаные пляжи залива, готические руины и карельские скалы.\n\n"
-        "Куда поедем сегодня? Выбирай фильтр в меню ниже 👇"
+        "👋 <b>Добро пожаловать в гид по атмосферным локациям СПб и ЛО!</b>\n\n"
+        "📍 <b>Точка старта: м. «Озерки»</b> (быстрый выезд на Выборгское ш., Скандинавию, Сортавалу и КАД).\n"
+        "Здесь собраны самые вирусные и эстетичные места из <b>TikTok и Pinterest</b>: "
+        "экотропы, маяки, песчаные дюны, карельские скалы и заброшенные кирхи.\n\n"
+        "💡 <b>Как это работает:</b>\n"
+        "• Локации показываются <b>по одной</b>.\n"
+        "• Жми <b>❤️ В избранное</b>, чтобы сохранить в коллекцию.\n"
+        "• Жми <b>➡️ Пропустить</b>, чтобы листать дальше (места не будут повторяться!).\n"
+        "• Бот <b>запоминает твой вкус</b> и предлагает похожие места в первую очередь!\n\n"
+        f"🎯 Текущий фильтр расстояния: <b>{dist_name}</b>"
     )
     await message.answer(greeting, parse_mode="HTML", reply_markup=get_main_menu_keyboard())
 
 
-@dp.message(F.text == "🚗 Выбрать по расстоянию")
-async def choose_distance(message: types.Message):
-    """Меню выбора расстояния."""
-    builder = InlineKeyboardBuilder()
-    for key, label in DISTANCE_GROUPS.items():
-        count = len([p for p in PLACES if p["range_group"] == key])
-        builder.row(InlineKeyboardButton(text=f"{label} ({count})", callback_data=f"show_dist_{key}"))
+@dp.message(F.text == "🧭 Смотреть локации")
+async def show_feed(message: types.Message):
+    """Показать следующую подходящую локацию."""
+    user_id = message.from_user.id
+    next_place = db.get_next_smart_place(user_id)
     
+    if not next_place:
+        dist_filter = db.get_user_distance_filter(user_id)
+        dist_name = DISTANCE_GROUPS.get(dist_filter, "выбранном радиусе")
+        await message.answer(
+            f"🎉 <b>Ты просмотрел все локации в фильтре «{dist_name}»!</b>\n\n"
+            "Что можно сделать:\n"
+            "1. Нажать <b>«📏 Фильтр расстояния»</b> и выбрать другой радиус (например, дальше 50 или 80 км).\n"
+            "2. Открыть <b>«⭐ Избранное»</b> и изучить сохраненные места.\n"
+            "3. Нажать <b>«🔄 Сбросить историю»</b>, чтобы пролистать все места заново.",
+            parse_mode="HTML"
+        )
+        return
+        
+    card_text = format_card(next_place)
+    kb = get_swipe_keyboard(next_place["id"], next_place["yandex_map"])
+    await message.answer(card_text, parse_mode="HTML", reply_markup=kb)
+
+
+# ---------------- РЕАКЦИИ: LIKE / SKIP ----------------
+
+@dp.callback_query(F.data.startswith("like_"))
+async def handle_like(callback: types.CallbackQuery):
+    user_id = callback.from_user.id
+    place_id = callback.data.split("_", 1)[1]
+    
+    db.record_reaction(user_id, place_id, "liked")
+    await callback.answer("Сохранено в Избранное! ⭐", show_alert=False)
+    
+    # Показываем следующее умное место
+    next_place = db.get_next_smart_place(user_id)
+    if not next_place:
+        await callback.message.edit_text(
+            "🎉 <b>Отлично! Ты просмотрел все доступные локации в этом фильтре!</b>\n\n"
+            "Все сохраненные споты ждут тебя во вкладке <b>«⭐ Избранное»</b>.\n"
+            "Чтобы расширить радиус, нажми <b>«📏 Фильтр расстояния»</b> в меню.",
+            parse_mode="HTML"
+        )
+        return
+        
+    card_text = format_card(next_place)
+    kb = get_swipe_keyboard(next_place["id"], next_place["yandex_map"])
+    await callback.message.edit_text(card_text, parse_mode="HTML", reply_markup=kb)
+
+
+@dp.callback_query(F.data.startswith("skip_"))
+async def handle_skip(callback: types.CallbackQuery):
+    user_id = callback.from_user.id
+    place_id = callback.data.split("_", 1)[1]
+    
+    db.record_reaction(user_id, place_id, "skipped")
+    await callback.answer("Пропущено", show_alert=False)
+    
+    next_place = db.get_next_smart_place(user_id)
+    if not next_place:
+        await callback.message.edit_text(
+            "🎉 <b>Ты просмотрел все локации в этом фильтре!</b>\n\n"
+            "Попробуй выбрать больший радиус в меню <b>«📏 Фильтр расстояния»</b> или сбросить историю в <b>«🔄 Сбросить историю»</b>.",
+            parse_mode="HTML"
+        )
+        return
+        
+    card_text = format_card(next_place)
+    kb = get_swipe_keyboard(next_place["id"], next_place["yandex_map"])
+    await callback.message.edit_text(card_text, parse_mode="HTML", reply_markup=kb)
+
+
+# ---------------- ИЗБРАННОЕ ----------------
+
+@dp.message(F.text == "⭐ Избранное")
+async def show_favorites(message: types.Message):
+    user_id = message.from_user.id
+    favorites = db.get_user_favorites(user_id)
+    
+    if not favorites:
+        await message.answer(
+            "⭐ <b>Твое избранное пока пусто!</b>\n\n"
+            "Нажми <b>«🧭 Смотреть локации»</b> и жми <b>❤️ В избранное</b> на местах, которые тебе понравятся.",
+            parse_mode="HTML"
+        )
+        return
+        
+    builder = InlineKeyboardBuilder()
+    for place in favorites:
+        btn_text = f"📍 {place['title']} (~{place['distance_km']} км)"
+        builder.row(InlineKeyboardButton(text=btn_text, callback_data=f"fav_view_{place['id']}"))
+        
     await message.answer(
-        "📏 <b>На какое расстояние от м. Озерки готов поехать?</b>\n"
-        "Выбирай радиус поездки:",
+        f"⭐ <b>Твои сохраненные локации ({len(favorites)}):</b>\n"
+        "Нажми на любое место, чтобы открыть карточку и маршрут:",
         parse_mode="HTML",
         reply_markup=builder.as_markup()
     )
 
 
-@dp.message(F.text == "🌲 По категориям")
-async def choose_category(message: types.Message):
-    """Меню выбора категории."""
-    builder = InlineKeyboardBuilder()
-    for cat_id, cat_name in CATEGORY_NAMES.items():
-        count = len([p for p in PLACES if p["category"] == cat_id])
-        builder.row(InlineKeyboardButton(text=f"{cat_name} ({count})", callback_data=f"show_cat_{cat_id}"))
-    
-    await message.answer(
-        "✨ <b>Какой вайб поездки ищем сегодня?</b>",
-        parse_mode="HTML",
-        reply_markup=builder.as_markup()
-    )
-
-
-@dp.message(F.text == "🎲 Случайное место")
-async def random_place_cmd(message: types.Message):
-    """Случайный выбор места."""
-    place = random.choice(PLACES)
-    card_text = format_place_card(place)
-    await message.answer(
-        f"🎲 <b>Твой рандомный спот на сегодня:</b>\n\n{card_text}",
-        parse_mode="HTML",
-        reply_markup=get_place_keyboard(place, back_action="main")
-    )
-
-
-@dp.message(F.text == "ℹ️ О гиде (Точка старта: Озерки)")
-async def about_guide(message: types.Message):
-    """Информация о точке старта."""
-    about_text = (
-        "🧭 <b>Почему точка отсчета — м. «Озерки»?</b>\n\n"
-        "Озерки — главные 'северные ворота' Питера для загородных поездок на авто. "
-        "Отсюда начинаются прямые скоростные выезды:\n"
-        "• <b>Выборгское шоссе</b> — прямиком к озерам и карельским лесам\n"
-        "• <b>Трасса «Скандинавия» (А-181)</b> — скоростной автобан до Выборга и Монрепо\n"
-        "• <b>Трасса «Сортавала» (А-121)</b> — новая 4-полосная дорога на Вуоксу и Приозерск\n"
-        "• <b>Северный участок КАД и ЗСД</b> — моментальный выезд на Курортный район и дамбу Кронштадта\n\n"
-        "🚙 <b>Все локации проверены:</b> к каждой точке есть комфортный подъезд на обычном легковом автомобиле."
-    )
-    await message.answer(about_text, parse_mode="HTML", reply_markup=get_main_menu_keyboard())
-
-
-# ---------------- КАТАЛОГИ И КОЛЛБЭКИ ----------------
-
-@dp.callback_query(F.data.startswith("show_dist_"))
-async def list_places_by_distance(callback: types.CallbackQuery):
-    dist_key = callback.data.split("_", 2)[2]
-    filtered = [p for p in PLACES if p["range_group"] == dist_key]
-    
-    builder = InlineKeyboardBuilder()
-    for p in filtered:
-        builder.row(InlineKeyboardButton(text=f"📍 {p['title']} (~{p['distance_km']} км)", callback_data=f"place_{p['id']}_dist_{dist_key}"))
-    builder.row(InlineKeyboardButton(text="⬅️ Назад к расстояниям", callback_data="back_to_dist"))
-    
-    group_name = DISTANCE_GROUPS.get(dist_key, "")
-    await callback.message.edit_text(
-        f"🚘 <b>Места в радиусе: {group_name}</b>\n\nВыбери локацию, чтобы посмотреть фото-гид и маршрут:",
-        parse_mode="HTML",
-        reply_markup=builder.as_markup()
-    )
-
-
-@dp.callback_query(F.data.startswith("show_cat_"))
-async def list_places_by_category(callback: types.CallbackQuery):
-    cat_key = callback.data.split("_", 2)[2]
-    filtered = [p for p in PLACES if p["category"] == cat_key]
-    
-    builder = InlineKeyboardBuilder()
-    for p in filtered:
-        builder.row(InlineKeyboardButton(text=f"📍 {p['title']} (~{p['distance_km']} км)", callback_data=f"place_{p['id']}_cat_{cat_key}"))
-    builder.row(InlineKeyboardButton(text="⬅️ Назад к категориям", callback_data="back_to_cat"))
-    
-    cat_name = CATEGORY_NAMES.get(cat_key, "")
-    await callback.message.edit_text(
-        f"🌲 <b>Категория: {cat_name}</b>\n\nВыбери локацию для подробностей:",
-        parse_mode="HTML",
-        reply_markup=builder.as_markup()
-    )
-
-
-@dp.callback_query(F.data.startswith("place_"))
-async def view_place_details(callback: types.CallbackQuery):
-    parts = callback.data.split("_")
-    place_id = parts[1]
-    back_action = "_".join(parts[2:]) if len(parts) > 2 else "main"
+@dp.callback_query(F.data.startswith("fav_view_"))
+async def view_favorite_place(callback: types.CallbackQuery):
+    user_id = callback.from_user.id
+    place_id = callback.data.split("_", 2)[2]
     
     place = next((p for p in PLACES if p["id"] == place_id), None)
     if not place:
         await callback.answer("Локация не найдена!", show_alert=True)
         return
+        
+    card_text = format_card(place)
     
-    card = format_place_card(place)
+    builder = InlineKeyboardBuilder()
+    builder.row(InlineKeyboardButton(text="🗺 Маршрут в Яндекс.Картах", url=place["yandex_map"]))
+    builder.row(InlineKeyboardButton(text="❌ Удалить из избранного", callback_data=f"fav_del_{place['id']}"))
+    builder.row(InlineKeyboardButton(text="⬅️ Назад в Избранное", callback_data="fav_back_list"))
+    
+    await callback.message.edit_text(card_text, parse_mode="HTML", reply_markup=builder.as_markup())
+
+
+@dp.callback_query(F.data.startswith("fav_del_"))
+async def delete_favorite_place(callback: types.CallbackQuery):
+    user_id = callback.from_user.id
+    place_id = callback.data.split("_", 2)[2]
+    
+    db.remove_favorite(user_id, place_id)
+    await callback.answer("Удалено из избранного!", show_alert=True)
+    
+    # Обновляем список избранного
+    favorites = db.get_user_favorites(user_id)
+    if not favorites:
+        await callback.message.edit_text(
+            "⭐ <b>В избранном больше ничего нет.</b>\n"
+            "Жми «🧭 Смотреть локации» в меню, чтобы найти новые!",
+            parse_mode="HTML"
+        )
+        return
+        
+    builder = InlineKeyboardBuilder()
+    for place in favorites:
+        btn_text = f"📍 {place['title']} (~{place['distance_km']} км)"
+        builder.row(InlineKeyboardButton(text=btn_text, callback_data=f"fav_view_{place['id']}"))
+        
     await callback.message.edit_text(
-        card,
+        f"⭐ <b>Твои сохраненные локации ({len(favorites)}):</b>",
         parse_mode="HTML",
-        reply_markup=get_place_keyboard(place, back_action=back_action)
+        reply_markup=builder.as_markup()
     )
 
 
-@dp.callback_query(F.data == "random_place")
-async def cb_random_place(callback: types.CallbackQuery):
-    place = random.choice(PLACES)
-    card = format_place_card(place)
+@dp.callback_query(F.data == "fav_back_list")
+async def back_to_fav_list(callback: types.CallbackQuery):
+    user_id = callback.from_user.id
+    favorites = db.get_user_favorites(user_id)
+    
+    if not favorites:
+        await callback.message.edit_text("⭐ Твое избранное пусто.", parse_mode="HTML")
+        return
+        
+    builder = InlineKeyboardBuilder()
+    for place in favorites:
+        btn_text = f"📍 {place['title']} (~{place['distance_km']} км)"
+        builder.row(InlineKeyboardButton(text=btn_text, callback_data=f"fav_view_{place['id']}"))
+        
     await callback.message.edit_text(
-        f"🎲 <b>Случайная рекомендация:</b>\n\n{card}",
+        f"⭐ <b>Твои сохраненные локации ({len(favorites)}):</b>",
         parse_mode="HTML",
-        reply_markup=get_place_keyboard(place, back_action="main")
+        reply_markup=builder.as_markup()
     )
 
 
-@dp.callback_query(F.data == "back_to_dist")
-async def cb_back_to_dist(callback: types.CallbackQuery):
+# ---------------- ФИЛЬТР РАССТОЯНИЯ ----------------
+
+@dp.message(F.text == "📏 Фильтр расстояния")
+async def change_distance_filter(message: types.Message):
+    user_id = message.from_user.id
+    current_filter = db.get_user_distance_filter(user_id)
+    
     builder = InlineKeyboardBuilder()
     for key, label in DISTANCE_GROUPS.items():
-        count = len([p for p in PLACES if p["range_group"] == key])
-        builder.row(InlineKeyboardButton(text=f"{label} ({count})", callback_data=f"show_dist_{key}"))
-    
-    await callback.message.edit_text(
-        "📏 <b>Выбери расстояние от м. Озерки:</b>",
+        mark = "✅ " if key == current_filter else ""
+        builder.row(InlineKeyboardButton(text=f"{mark}{label}", callback_data=f"set_dist_{key}"))
+        
+    await message.answer(
+        "📏 <b>Выбери максимальное расстояние от м. «Озерки»:</b>\n"
+        "Бот будет предлагать локации в этом радиусе.",
         parse_mode="HTML",
         reply_markup=builder.as_markup()
     )
 
 
-@dp.callback_query(F.data == "back_to_cat")
-async def cb_back_to_cat(callback: types.CallbackQuery):
+@dp.callback_query(F.data.startswith("set_dist_"))
+async def save_distance_filter(callback: types.CallbackQuery):
+    user_id = callback.from_user.id
+    key = callback.data.split("_", 2)[2]
+    
+    db.set_user_distance_filter(user_id, key)
+    dist_name = DISTANCE_GROUPS.get(key, "Все")
+    
+    await callback.answer(f"Фильтр обновлен: {dist_name}", show_alert=False)
+    await callback.message.edit_text(
+        f"✅ <b>Установлен фильтр:</b> {dist_name}\n\n"
+        "Теперь нажми <b>«🧭 Смотреть локации»</b>, чтобы продолжить просмотр с учетом нового расстояния!",
+        parse_mode="HTML"
+    )
+
+
+# ---------------- СТАТИСТИКА И ПРОФИЛЬ ----------------
+
+@dp.message(F.text == "📊 Мой профиль")
+async def user_profile(message: types.Message):
+    user_id = message.from_user.id
+    stats = db.get_user_stats(user_id)
+    dist_filter = db.get_user_distance_filter(user_id)
+    dist_name = DISTANCE_GROUPS.get(dist_filter, "Все")
+    
+    fav_pref = stats["top_category"] if stats["top_category"] else "еще формируется (лайкни пару мест)"
+    
+    profile_text = (
+        "📊 <b>Твой профиль путешественника:</b>\n\n"
+        f"👁 <b>Просмотрено мест:</b> {stats['total_seen']} из {stats['total_available']}\n"
+        f"❤️ <b>В избранном:</b> {stats['liked_count']}\n"
+        f"➡️ <b>Пропущено:</b> {stats['skipped_count']}\n\n"
+        f"✨ <b>Твой любимый вайб:</b> {fav_pref}\n"
+        f"🎯 <b>Радиус поиска:</b> {dist_name}\n\n"
+        "<i>На основе твоих лайков алгоритм ставит похожие места вперед ленты.</i>"
+    )
+    await message.answer(profile_text, parse_mode="HTML", reply_markup=get_main_menu_keyboard())
+
+
+# ---------------- СБРОС ИСТОРИИ ----------------
+
+@dp.message(F.text == "🔄 Сбросить историю")
+async def reset_history_prompt(message: types.Message):
     builder = InlineKeyboardBuilder()
-    for cat_id, cat_name in CATEGORY_NAMES.items():
-        count = len([p for p in PLACES if p["category"] == cat_id])
-        builder.row(InlineKeyboardButton(text=f"{cat_name} ({count})", callback_data=f"show_cat_{cat_id}"))
-    
-    await callback.message.edit_text(
-        "✨ <b>Выбери категорию локаций:</b>",
+    builder.row(
+        InlineKeyboardButton(text="⚠️ Да, сбросить всё заново", callback_data="confirm_reset"),
+        InlineKeyboardButton(text="Отмена", callback_data="cancel_reset")
+    )
+    await message.answer(
+        "⚠️ <b>Ты точно хочешь сбросить всю историю?</b>\n\n"
+        "Это очистит список просмотренных мест и избранное, "
+        "чтобы ты мог пролистать все локации с чистого листа.",
         parse_mode="HTML",
         reply_markup=builder.as_markup()
     )
 
 
-@dp.callback_query(F.data == "menu_home")
-async def cb_menu_home(callback: types.CallbackQuery):
-    await callback.message.delete()
-    await callback.message.answer(
-        "🏠 Главное меню. Выбирай действие кнопками внизу 👇",
-        reply_markup=get_main_menu_keyboard()
+@dp.callback_query(F.data == "confirm_reset")
+async def confirm_reset_history(callback: types.CallbackQuery):
+    user_id = callback.from_user.id
+    db.reset_user_history(user_id)
+    
+    await callback.answer("История полностью очищена!", show_alert=True)
+    await callback.message.edit_text(
+        "🔄 <b>Вся статистика и история успешно сброшены!</b>\n\n"
+        "Теперь все локации снова доступны к просмотру. Нажимай <b>«🧭 Смотреть локации»</b>!",
+        parse_mode="HTML"
     )
 
+
+@dp.callback_query(F.data == "cancel_reset")
+async def cancel_reset_history(callback: types.CallbackQuery):
+    await callback.message.delete()
+
+
+# ---------------- ТОЧКА ВХОДА ----------------
 
 async def main():
     if not bot:
-        print("[!] Не удалось запустить бота: токен отсутствует.")
+        print("[!] Ошибка: Не указан токен бота в .env или BOT_TOKEN!")
         sys.exit(1)
-    
+        
     print("=" * 60)
-    print("🚀 Бот локаций СПб (старт: м. Озерки) успешно запущен!")
-    print("   Открой Telegram и напиши /start своему боту.")
+    print("🚀 Умный бот локаций СПб (старт: м. Озерки) запущен!")
+    print("   База данных SQLite подключена.")
     print("=" * 60)
     await dp.start_polling(bot)
 
